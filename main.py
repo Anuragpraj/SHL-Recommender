@@ -16,6 +16,9 @@ from pydantic import BaseModel
 
 # ── Catalog ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CATALOG_URLS = {item["url"] for item in CATALOG}
+CATALOG_BY_URL = {item["url"]: item for item in CATALOG}
+CATALOG_BY_NAME = {item["name"].lower(): item for item in CATALOG}
 with open(os.path.join(BASE_DIR, "catalog.json")) as f:
     CATALOG = json.load(f)
 
@@ -147,21 +150,28 @@ def chat(request: ChatRequest):
     validated = None
     if recs is not None:
         validated = []
-        catalog_urls = {item["url"] for item in CATALOG}
         for rec in recs[:10]:
             url = rec.get("url", "")
-            if url not in catalog_urls:
-                hit = next((c for c in CATALOG if c["name"].lower() == rec.get("name","").lower()), None)
-                if hit:
+            if url not in CATALOG_URLS:
+               hit = CATALOG_BY_NAME.get(rec.get("name", "").lower())
+               if hit:
                     url = hit["url"]
-                else:
-                    continue
-            cat = next((c for c in CATALOG if c["url"] == url), None)
-            if not cat:
-                continue
-            validated.append(Recommendation(
-                name=rec.get("name", cat["name"]),
-                url=url,
+               else:
+                    rec_name_lower = rec.get("name", "").lower()
+                    hit = next(
+                        (c for c in CATALOG if rec_name_lower in c["name"].lower()
+                         or c["name"].lower() in rec_name_lower),
+                         None
+                    )
+                    if hit:
+                        url = hit["url"]
+                    else:
+                         continue
+        cat = CATALOG_BY_URL.get(url)
+        if not cat:
+           continue
+        validated.append(Recommendation(
+            name=cat["name"],  # canonical name from catalog
                 test_type=rec.get("test_type", cat["test_types"][0] if cat["test_types"] else "K"),
                 duration=rec.get("duration", cat["duration"]),
                 remote_testing=cat["remote"],
@@ -171,6 +181,6 @@ def chat(request: ChatRequest):
 
     return ChatResponse(
         reply=parsed.get("reply", ""),
-        recommendations=validated if validated else None,
+        recommendations=validated,
         end_of_conversation=bool(parsed.get("end_of_conversation", False)),
     )
