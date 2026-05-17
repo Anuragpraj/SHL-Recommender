@@ -1,7 +1,7 @@
 """
 SHL Conversational Assessment Recommender
 FastAPI — /health + /chat
-LLM: OpenRouter (meta-llama/llama-3.3-70b-instruct:free)
+LLM: OpenRouter (multi-model fallback with free tier)
 """
 
 import json, os, re
@@ -77,12 +77,44 @@ CATALOG_BY_NAME = {item["name"].lower(): item for item in CATALOG}
 OR_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 if not OR_KEY:
     print("WARNING: OPENROUTER_API_KEY not set. Add it to your .env file or Render env vars.")
-    # Don\'t raise error here — let it fail gracefully on first API call
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=OR_KEY or "dummy-key-for-startup",
 )
+
+# ── Multi-model fallback configuration ──────────────────────────────────────────
+FREE_MODELS = [
+    "deepseek/deepseek-chat-v3-0324:free",
+    "meta-llama/llama-4-maverick:free",
+    "qwen/qwen3-235b-a22b:free",
+    "openrouter/free",
+]
+
+def call_llm_with_fallback(api_messages):
+    """Try multiple free models, return first successful response."""
+    last_error = None
+
+    for model in FREE_MODELS:
+        try:
+            print(f"[OpenRouter] Trying model: {model}")
+            response = client.chat.completions.create(
+                model       = model,
+                messages    = api_messages,
+                temperature = 0.1,
+                max_tokens  = 2048,
+                timeout     = 30,
+            )
+            raw_text = response.choices[0].message.content.strip()
+            print(f"[OpenRouter] Success with {model}")
+            return raw_text
+
+        except Exception as e:
+            last_error = str(e)
+            print(f"[OpenRouter] Failed {model}: {e}")
+            continue
+
+    raise Exception(f"All models failed. Last error: {last_error}")
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = f"""You are an expert SHL assessment consultant. You help HR professionals and hiring managers select the right assessments from the SHL catalog. You are precise, grounded, and never recommend anything outside the catalog below.
@@ -95,7 +127,7 @@ SYSTEM_PROMPT = f"""You are an expert SHL assessment consultant. You help HR pro
 ## STRICT BEHAVIORAL RULES
 
 ### CLARIFY
-- If the user\'s first message is vague (no clear role, no domain, no context), ask exactly ONE focused clarifying question. Do NOT recommend on turn 1 for a vague query.
+- If the user's first message is vague (no clear role, no domain, no context), ask exactly ONE focused clarifying question. Do NOT recommend on turn 1 for a vague query.
 - Useful clarifying dimensions: job role/function, seniority level, selection vs development purpose, language requirements.
 - While clarifying: set recommendations=null.
 
@@ -115,7 +147,7 @@ SYSTEM_PROMPT = f"""You are an expert SHL assessment consultant. You help HR pro
 
 ### CLOSE
 - Set end_of_conversation=true ONLY when the user explicitly confirms they are done.
-- Trigger words: "confirmed", "perfect", "that\'s it", "locking it in", "done", "finalized", "that works", "thanks", "good".
+- Trigger words: "confirmed", "perfect", "that's it", "locking it in", "done", "finalized", "that works", "thanks", "good".
 - Do NOT self-close. Wait for explicit user confirmation.
 
 ### SCOPE GUARD
@@ -148,7 +180,7 @@ A=Ability/Aptitude  B=Biodata/SJT  C=Competencies  D=Development  K=Knowledge/Sk
 """
 
 # ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="SHL Assessment Recommender", version="1.0.0")
+app = FastAPI(title="SHL Assessment Recommender", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -287,24 +319,24 @@ def chat(request: ChatRequest):
         api_messages.append({"role": m.role, "content": m.content})
 
     # Check API key
-    if not OR_KEY:
+    if not OR_KEY or OR_KEY == "dummy-key-for-startup":
         return ChatResponse(
             reply               = "Service temporarily unavailable: OPENROUTER_API_KEY not configured. Please contact the administrator.",
             recommendations     = None,
             end_of_conversation = False,
         )
 
-    # Call LLM via OpenRouter
+    # Call LLM with multi-model fallback
     try:
-        response = client.chat.completions.create(
-            model       = "meta-llama/llama-3.3-70b-instruct:free",
-            messages    = api_messages,
-            temperature = 0.1,
-            max_tokens  = 2048,
-        )
-        raw_text = response.choices[0].message.content.strip()
+        raw_text = call_llm_with_fallback(api_messages)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"LLM API error: {str(e)}")
+        # Graceful fallback — never return 502
+        print(f"[ERROR] All LLM models failed: {e}")
+        return ChatResponse(
+            reply               = "I\'m experiencing high traffic right now. Please try again in 30 seconds.",
+            recommendations     = None,
+            end_of_conversation = False,
+        )
 
     # Parse JSON robustly
     parsed = robust_json_parse(raw_text)
