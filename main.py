@@ -1,7 +1,7 @@
 """
 SHL Conversational Assessment Recommender
 FastAPI — /health + /chat
-LLM: OpenRouter (mistralai/mistral-7b-instruct:free)
+LLM: OpenRouter (meta-llama/llama-3.3-70b-instruct:free)
 """
 
 import json, os, re
@@ -16,7 +16,15 @@ from pydantic import BaseModel
 
 # ── Catalog ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-with open(os.path.join(BASE_DIR, "catalog.json")) as f:
+CATALOG_PATH = os.path.join(BASE_DIR, "catalog.json")
+
+if not os.path.exists(CATALOG_PATH):
+    raise FileNotFoundError(
+        f"catalog.json not found at {CATALOG_PATH}. "
+        f"Please ensure catalog.json is in the same directory as main.py"
+    )
+
+with open(CATALOG_PATH, encoding="utf-8") as f:
     CATALOG = json.load(f)
 
 def build_compact_catalog(catalog):
@@ -25,11 +33,11 @@ def build_compact_catalog(catalog):
         types  = ",".join(item.get("test_types", []))
         levels = "|".join(item.get("job_levels", [])[:3])
         langs  = "|".join(item.get("languages", [])[:3])
-        desc   = item.get("description", "")[:150]
+        desc   = item.get("description", "")[:120]
         lines.append(
             f'[{item["name"]}] type={types} dur={item.get("duration","?")} '
-            f'levels={levels} remote={item.get("remote","?")} '
-            f'adaptive={item.get("adaptive","?")} langs={langs} '
+            f'levels={levels} remote={"Y" if item.get("remote") else "N"} '
+            f'adaptive={"Y" if item.get("adaptive") else "N"} langs={langs} '
             f'url={item["url"]} | {desc}'
         )
     return "\n".join(lines)
@@ -142,6 +150,8 @@ class ChatResponse(BaseModel):
     end_of_conversation: bool
 
 # ── Validator ─────────────────────────────────────────────────────────────────
+TEST_TYPE_CODES = {"A", "B", "C", "D", "K", "P", "S"}
+
 def validate_recommendations(recs) -> Optional[list[Recommendation]]:
     """Keep only real catalog items. Fix URLs via name lookup if needed."""
     if not isinstance(recs, list):
@@ -164,16 +174,68 @@ def validate_recommendations(recs) -> Optional[list[Recommendation]]:
         if not cat:
             continue
 
+        # Validate test_type code
+        test_type = rec.get("test_type", "").upper()
+        if test_type not in TEST_TYPE_CODES:
+            catalog_types = cat.get("test_types", ["K"])
+            test_type = catalog_types[0] if catalog_types else "K"
+
         validated.append(Recommendation(
             name           = cat["name"],
             url            = cat["url"],
-            test_type      = rec.get("test_type", ",".join(cat.get("test_types", ["K"]))),
+            test_type      = test_type,
             duration       = rec.get("duration", cat.get("duration", "")),
             remote_testing = cat.get("remote", True),
             adaptive_irt   = cat.get("adaptive", False),
             description    = rec.get("description", cat.get("description", "")[:200]),
         ))
     return validated if validated else None
+
+# ── Robust JSON Parser ────────────────────────────────────────────────────────
+def robust_json_parse(raw_text: str) -> dict | None:
+    """Try multiple strategies to extract valid JSON from model output."""
+    raw_text = raw_text.strip()
+
+    # Strategy 1: Direct parse
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: Extract JSON from markdown fences
+    fence_pattern = r"```(?:json)?\s*([\s\S]*?)```"
+    matches = re.findall(fence_pattern, raw_text)
+    for match in matches:
+        try:
+            return json.loads(match.strip())
+        except json.JSONDecodeError:
+            continue
+
+    # Strategy 3: Find outermost JSON object using balanced braces
+    depth = 0
+    start = -1
+    for i, char in enumerate(raw_text):
+        if char == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    return json.loads(raw_text[start:i+1])
+                except json.JSONDecodeError:
+                    continue
+
+    # Strategy 4: Regex fallback
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except Exception:
+            pass
+
+    return None
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 @app.get("/health")
@@ -185,7 +247,7 @@ def chat(request: ChatRequest):
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages cannot be empty")
 
-    # Enforce 8-turn cap
+    # Enforce 8-turn cap (4 user + 4 assistant max)
     messages = list(request.messages)
     if len(messages) > 8:
         messages = messages[-8:]
@@ -200,7 +262,7 @@ def chat(request: ChatRequest):
     # Call LLM via OpenRouter
     try:
         response = client.chat.completions.create(
-            model       = "mistralai/mistral-7b-instruct:free",
+            model       = "meta-llama/llama-3.3-70b-instruct:free",
             messages    = api_messages,
             temperature = 0.1,
             max_tokens  = 2048,
@@ -209,22 +271,8 @@ def chat(request: ChatRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM API error: {str(e)}")
 
-    # Strip markdown fences if model added them
-    raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.MULTILINE)
-    raw_text = re.sub(r"\s*```\s*$",        "", raw_text, flags=re.MULTILINE)
-    raw_text = raw_text.strip()
-
-    # Parse JSON
-    parsed = None
-    try:
-        parsed = json.loads(raw_text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group())
-            except Exception:
-                pass
+    # Parse JSON robustly
+    parsed = robust_json_parse(raw_text)
 
     if not parsed:
         return ChatResponse(

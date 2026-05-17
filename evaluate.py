@@ -13,12 +13,6 @@ import argparse, json, time, sys
 import requests
 
 # ── Conversation Traces ───────────────────────────────────────────────────────
-# Each trace has:
-#   turns          — ordered list of user messages (we replay these one by one)
-#   expected_final — assessment names expected in the final shortlist
-#   expected_eoc   — whether end_of_conversation should be True at the end
-#   vague_turn_1   — True if turn 1 is vague (agent must NOT recommend on turn 1)
-
 TRACES = [
     {
         "id": "C1",
@@ -219,6 +213,8 @@ def check_schema(resp: dict) -> tuple[bool, str]:
     if recs is not None:
         if not isinstance(recs, list):
             return False, f"'recommendations' must be null or array, got {type(recs).__name__}"
+        if len(recs) == 0:
+            return False, "'recommendations' is [] — use null for clarifying turns"
         if len(recs) > 10:
             return False, f"'recommendations' has {len(recs)} items — max is 10"
         required = {"name", "url", "test_type", "duration", "remote_testing", "adaptive_irt", "description"}
@@ -226,6 +222,10 @@ def check_schema(resp: dict) -> tuple[bool, str]:
             missing = required - set(r.keys())
             if missing:
                 return False, f"Recommendation[{i}] missing fields: {missing}"
+            # Validate test_type is single letter code
+            test_type = r.get("test_type", "")
+            if not isinstance(test_type, str) or len(test_type) != 1 or test_type not in "ABCDKPS":
+                return False, f"Recommendation[{i}] invalid test_type: '{test_type}' — must be one of A,B,C,D,K,P,S"
 
     return True, "OK"
 
@@ -276,16 +276,18 @@ def run_evaluation(base_url: str):
         print(f"  {trace['id']}: {trace['description']}")
         print(f"{'─'*62}")
 
-        history        = []          # full conversation history sent each turn
+        history        = []
         schema_ok_all  = True
-        final_recs     = None        # names from last recommendations array
+        final_recs     = None
         final_eoc      = False
-        probe_vague_ok = True        # turn-1 vague check
+        probe_vague_ok = True
+        probe_commit_ok = True
+        has_committed  = False
 
         for i, user_msg in enumerate(trace["turns"]):
             turn_num = i + 1
             short_msg = user_msg[:70] + "..." if len(user_msg) > 70 else user_msg
-            print(f"  Turn {turn_num}: \"{short_msg}\"")
+            print(f"  Turn {turn_num}: "{short_msg}"")
 
             history.append({"role": "user", "content": user_msg})
 
@@ -304,21 +306,31 @@ def run_evaluation(base_url: str):
             if not ok:
                 schema_ok_all = False
 
+            recs = resp.get("recommendations")
+            n_recs = len(recs) if recs else 0
+
+            # Track commitment state
+            if recs is not None and n_recs > 0:
+                has_committed = True
+
             # Turn-1 vague probe
             if turn_num == 1 and trace["vague_turn_1"]:
-                if resp.get("recommendations") is not None:
+                if recs is not None:
                     probe_vague_ok = False
                     print(f"      Schema:{schema_marker} | PROBE FAIL: recommended on vague turn 1!")
                 else:
                     print(f"      Schema:{schema_marker} | Probe:no-rec-on-vague-T1=PASS | recs=null | eoc={resp.get('end_of_conversation')}")
             else:
-                recs = resp.get("recommendations")
-                n_recs = len(recs) if recs else 0
-                print(f"      Schema:{schema_marker} | recs={'null' if recs is None else n_recs} | eoc={resp.get('end_of_conversation')}")
+                # Check for regression: going back to null after commitment
+                if has_committed and recs is None and turn_num > 1:
+                    probe_commit_ok = False
+                    print(f"      Schema:{schema_marker} | PROBE FAIL: dropped recommendations after commitment!")
+                else:
+                    print(f"      Schema:{schema_marker} | recs={'null' if recs is None else n_recs} | eoc={resp.get('end_of_conversation')}")
 
             # Track final state
-            if resp.get("recommendations"):
-                final_recs = [r["name"] for r in resp["recommendations"]]
+            if recs:
+                final_recs = [r["name"] for r in recs]
             final_eoc = resp.get("end_of_conversation", False)
 
             time.sleep(0.4)  # avoid rate limiting
@@ -348,7 +360,7 @@ def run_evaluation(base_url: str):
             "schema_pass" : schema_ok_all,
             "recall"      : recall,
             "eoc_pass"    : eoc_match,
-            "probe_pass"  : probe_vague_ok,
+            "probe_pass"  : probe_vague_ok and probe_commit_ok,
         })
 
     # ── Summary ──────────────────────────────────────────────────────────────
