@@ -1,7 +1,7 @@
 """
 SHL Conversational Assessment Recommender
 FastAPI — /health + /chat
-LLM: OpenRouter (meta-llama/llama-3.3-70b-instruct:free)
+LLM: OpenRouter (mistralai/mistral-7b-instruct:free)
 """
 
 import json, os, re
@@ -200,7 +200,7 @@ def chat(request: ChatRequest):
     # Call LLM via OpenRouter
     try:
         response = client.chat.completions.create(
-            model       = "meta-llama/llama-3.3-70b-instruct:free",
+            model       = "mistralai/mistral-7b-instruct:free",
             messages    = api_messages,
             temperature = 0.1,
             max_tokens  = 2048,
