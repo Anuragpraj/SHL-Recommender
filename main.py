@@ -16,11 +16,12 @@ from pydantic import BaseModel
 
 # ── Catalog ───────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(BASE_DIR, "catalog.json")) as f:
+    CATALOG = json.load(f)
+
 CATALOG_URLS = {item["url"] for item in CATALOG}
 CATALOG_BY_URL = {item["url"]: item for item in CATALOG}
 CATALOG_BY_NAME = {item["name"].lower(): item for item in CATALOG}
-with open(os.path.join(BASE_DIR, "catalog.json")) as f:
-    CATALOG = json.load(f)
 
 def build_compact_catalog(catalog):
     lines = []
@@ -136,47 +137,54 @@ def chat(request: ChatRequest):
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if m:
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
             try:
-                parsed = json.loads(m.group())
-            except:
+                parsed = json.loads(match.group())
+            except Exception:
                 parsed = {"reply": raw_text, "recommendations": None, "end_of_conversation": False}
         else:
             parsed = {"reply": raw_text, "recommendations": None, "end_of_conversation": False}
 
-    # Validate — only allow catalog URLs
+    # ── URL Validator: only allow catalog URLs ────────────────────────────────
     recs = parsed.get("recommendations")
     validated = None
     if recs is not None:
         validated = []
         for rec in recs[:10]:
             url = rec.get("url", "")
+
             if url not in CATALOG_URLS:
-               hit = CATALOG_BY_NAME.get(rec.get("name", "").lower())
-               if hit:
+                # Exact name lookup
+                hit = CATALOG_BY_NAME.get(rec.get("name", "").lower())
+                if hit:
                     url = hit["url"]
-               else:
+                else:
+                    # Partial name match
                     rec_name_lower = rec.get("name", "").lower()
                     hit = next(
-                        (c for c in CATALOG if rec_name_lower in c["name"].lower()
+                        (c for c in CATALOG
+                         if rec_name_lower in c["name"].lower()
                          or c["name"].lower() in rec_name_lower),
-                         None
+                        None
                     )
                     if hit:
                         url = hit["url"]
                     else:
-                         continue
-        cat = CATALOG_BY_URL.get(url)
-        if not cat:
-           continue
-        validated.append(Recommendation(
-            name=cat["name"],  # canonical name from catalog
+                        continue  # drop hallucinated entry
+
+            cat = CATALOG_BY_URL.get(url)
+            if not cat:
+                continue
+
+            validated.append(Recommendation(
+                name=cat["name"],
+                url=url,
                 test_type=rec.get("test_type", cat["test_types"][0] if cat["test_types"] else "K"),
-                duration=rec.get("duration", cat["duration"]),
-                remote_testing=cat["remote"],
-                adaptive_irt=cat["adaptive"],
-                description=rec.get("description", cat["description"][:150]),
+                duration=rec.get("duration", cat.get("duration", "?")),
+                remote_testing=cat.get("remote", False),
+                adaptive_irt=cat.get("adaptive", False),
+                description=rec.get("description", cat.get("description", "")[:150]),
             ))
 
     return ChatResponse(
