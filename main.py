@@ -27,33 +27,61 @@ if not os.path.exists(CATALOG_PATH):
 with open(CATALOG_PATH, encoding="utf-8") as f:
     CATALOG = json.load(f)
 
+# Map catalog keys to test_type letters
+KEY_TO_TYPE = {
+    "Ability & Aptitude": "A",
+    "Biodata & Situational Judgment": "B",
+    "Competencies": "C",
+    "Development & 360": "D",
+    "Knowledge & Skills": "K",
+    "Personality & Behavior": "P",
+    "Simulations": "S",
+    "Assessment Exercises": "A",
+}
+
+def get_test_type(keys):
+    """Map catalog keys to single test type letter."""
+    if not keys:
+        return "K"
+    for key in keys:
+        if key in KEY_TO_TYPE:
+            return KEY_TO_TYPE[key]
+    return "K"
+
+def str_to_bool(val):
+    """Convert 'yes'/'no' string to boolean."""
+    if isinstance(val, bool):
+        return val
+    return str(val).lower() in ("yes", "true", "1", "y")
+
 def build_compact_catalog(catalog):
     lines = []
     for item in catalog:
-        types  = ",".join(item.get("test_types", []))
+        types  = ",".join(item.get("keys", [])[:3])
         levels = "|".join(item.get("job_levels", [])[:3])
         langs  = "|".join(item.get("languages", [])[:3])
         desc   = item.get("description", "")[:120]
         lines.append(
             f'[{item["name"]}] type={types} dur={item.get("duration","?")} '
-            f'levels={levels} remote={"Y" if item.get("remote") else "N"} '
-            f'adaptive={"Y" if item.get("adaptive") else "N"} langs={langs} '
-            f'url={item["url"]} | {desc}'
+            f'levels={levels} remote={"Y" if str_to_bool(item.get("remote")) else "N"} '
+            f'adaptive={"Y" if str_to_bool(item.get("adaptive")) else "N"} langs={langs} '
+            f'url={item["link"]} | {desc}'
         )
     return "\n".join(lines)
 
 CATALOG_COMPACT = build_compact_catalog(CATALOG)
-CATALOG_BY_URL  = {item["url"]: item for item in CATALOG}
+CATALOG_BY_URL  = {item["link"]: item for item in CATALOG}
 CATALOG_BY_NAME = {item["name"].lower(): item for item in CATALOG}
 
 # ── OpenRouter client ─────────────────────────────────────────────────────────
 OR_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 if not OR_KEY:
-    raise ValueError("OPENROUTER_API_KEY not set. Add it to your .env file.")
+    print("WARNING: OPENROUTER_API_KEY not set. Add it to your .env file or Render env vars.")
+    # Don\'t raise error here — let it fail gracefully on first API call
 
 client = OpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=OR_KEY,
+    api_key=OR_KEY or "dummy-key-for-startup",
 )
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -67,7 +95,7 @@ SYSTEM_PROMPT = f"""You are an expert SHL assessment consultant. You help HR pro
 ## STRICT BEHAVIORAL RULES
 
 ### CLARIFY
-- If the user's first message is vague (no clear role, no domain, no context), ask exactly ONE focused clarifying question. Do NOT recommend on turn 1 for a vague query.
+- If the user\'s first message is vague (no clear role, no domain, no context), ask exactly ONE focused clarifying question. Do NOT recommend on turn 1 for a vague query.
 - Useful clarifying dimensions: job role/function, seniority level, selection vs development purpose, language requirements.
 - While clarifying: set recommendations=null.
 
@@ -87,7 +115,7 @@ SYSTEM_PROMPT = f"""You are an expert SHL assessment consultant. You help HR pro
 
 ### CLOSE
 - Set end_of_conversation=true ONLY when the user explicitly confirms they are done.
-- Trigger words: "confirmed", "perfect", "that's it", "locking it in", "done", "finalized", "that works", "thanks", "good".
+- Trigger words: "confirmed", "perfect", "that\'s it", "locking it in", "done", "finalized", "that works", "thanks", "good".
 - Do NOT self-close. Wait for explicit user confirmation.
 
 ### SCOPE GUARD
@@ -177,16 +205,15 @@ def validate_recommendations(recs) -> Optional[list[Recommendation]]:
         # Validate test_type code
         test_type = rec.get("test_type", "").upper()
         if test_type not in TEST_TYPE_CODES:
-            catalog_types = cat.get("test_types", ["K"])
-            test_type = catalog_types[0] if catalog_types else "K"
+            test_type = get_test_type(cat.get("keys", []))
 
         validated.append(Recommendation(
             name           = cat["name"],
-            url            = cat["url"],
+            url            = cat["link"],
             test_type      = test_type,
             duration       = rec.get("duration", cat.get("duration", "")),
-            remote_testing = cat.get("remote", True),
-            adaptive_irt   = cat.get("adaptive", False),
+            remote_testing = str_to_bool(cat.get("remote", True)),
+            adaptive_irt   = str_to_bool(cat.get("adaptive", False)),
             description    = rec.get("description", cat.get("description", "")[:200]),
         ))
     return validated if validated else None
@@ -258,6 +285,14 @@ def chat(request: ChatRequest):
         if m.role not in ("user", "assistant"):
             continue
         api_messages.append({"role": m.role, "content": m.content})
+
+    # Check API key
+    if not OR_KEY:
+        return ChatResponse(
+            reply               = "Service temporarily unavailable: OPENROUTER_API_KEY not configured. Please contact the administrator.",
+            recommendations     = None,
+            end_of_conversation = False,
+        )
 
     # Call LLM via OpenRouter
     try:
